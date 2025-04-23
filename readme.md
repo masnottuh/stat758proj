@@ -1,13 +1,13 @@
-## Slide 1: Title Slide
+## 1: Title Slide
 
 **Quantitative Signal Discovery: Finding Potential Stock Predictors in FRED Data**
 
 * Leveraging Python for Financial Data Analysis
-* [Your Name/Date]
+* Robert Hutton
 
 ---
 
-## Slide 2: Introduction & Goal
+## 2: Introduction & Goal
 
 **Objective:**
 
@@ -25,7 +25,7 @@
 
 ---
 
-## Slide 3: Core Workflow Overview
+## 3: Core Workflow Overview
 
 1.  **Setup:** Configure API keys, define target stock & dates.
 2.  **Fetch Target Data:** Get stock price/return data (yfinance).
@@ -44,7 +44,7 @@
 
 ---
 
-## Slide 4: Step 1: Setup & Configuration
+## 4: Step 1: Setup & Configuration
 
 **Goal:** Prepare the script environment and parameters.
 
@@ -64,7 +64,7 @@
 
 ---
 
-## Slide 5: Step 2: Data Fetching (Stock Data)
+## 5: Step 2: Data Fetching (Stock Data)
 
 **Goal:** Retrieve historical price data for the target stock.
 
@@ -81,7 +81,7 @@
 
 ---
 
-## Slide 6: Step 3: Data Fetching (FRED Popular Series IDs)
+## 6: Step 3: Data Fetching (FRED Popular Series IDs)
 
 **Goal:** Identify a broad set of potential predictor series from FRED without requiring specific user searches.
 
@@ -99,7 +99,7 @@
 
 ---
 
-## Slide 7: Step 4: Data Fetching (FRED Observations)
+## 7: Step 4: Data Fetching (FRED Observations)
 
 **Goal:** Retrieve the actual time series data (observations) for each identified FRED series ID.
 
@@ -119,7 +119,7 @@
 
 ---
 
-## Slide 8: Step 5: Data Alignment & Preparation
+## 8: Step 5: Data Alignment & Preparation
 
 **Goal:** Combine the target stock data and all fetched FRED series into a single DataFrame with a consistent daily index.
 
@@ -139,7 +139,7 @@
 
 ---
 
-## Slide 9: Step 6: Statistical Analysis - Stationarity
+## 9: Step 6: Statistical Analysis - Stationarity
 
 **Goal:** Determine if the time series have constant statistical properties (mean, variance) over time. *Crucial for reliable correlation, Granger causality, and many models.*
 
@@ -156,7 +156,7 @@
 
 ---
 
-## Slide 10: Step 7: Statistical Analysis - Cointegration
+## 10: Step 7: Statistical Analysis - Cointegration
 
 **Goal:** Check for a stable, long-run equilibrium relationship between two *non-stationary* series. (If they wander, do they wander together?)
 
@@ -172,7 +172,7 @@
 
 ---
 
-## Slide 11: Step 8: Statistical Analysis - Optimal Lag Selection
+## 11: Step 8: Statistical Analysis - Optimal Lag Selection
 
 **Goal:** Determine the most appropriate time lag for testing Granger causality, avoiding arbitrary choices.
 
@@ -191,7 +191,7 @@
 
 ---
 
-## Slide 12: Step 9: Statistical Analysis - Granger Causality
+## 12: Step 9: Statistical Analysis - Granger Causality
 
 **Goal:** Test if past values of the predictor series statistically help predict future values of the target series, *given past values of the target itself*. (Does predictor X "Granger-cause" target Y?)
 
@@ -209,7 +209,7 @@
 
 ---
 
-## Slide 13: Step 10: Statistical Analysis - Correlations & Mutual Info
+## 13: Step 10: Statistical Analysis - Correlations & Mutual Info
 
 **Goal:** Measure other forms of association between the target and predictor.
 
@@ -224,7 +224,7 @@
 
 ---
 
-## Slide 14: Step 11: Signal Ranking
+## 14: Step 11: Signal Ranking
 
 **Goal:** Combine the various statistical metrics into a single score to rank potential predictors based on their likely predictive utility.
 
@@ -245,7 +245,7 @@
 
 ---
 
-## Slide 15: Step 12: (Optional) Predictive Modeling - Prophet
+## 15: Step 12: (Optional) Predictive Modeling - Prophet
 
 **Goal:** Provide a baseline forecast using the top-ranked predictor as an external regressor in Facebook Prophet.
 
@@ -264,7 +264,7 @@
 
 ---
 
-## Slide 16: Step 13: (Optional) Predictive Modeling - XGBoost
+## 16: Step 13: (Optional) Predictive Modeling - XGBoost
 
 **Goal:** Provide a baseline forecast using a gradient boosting model (XGBoost) with lagged values of the top predictor.
 
@@ -282,7 +282,7 @@
 
 ---
 
-## Slide 17: Step 14: Output & Results
+## 17: Step 14: Output & Results
 
 **Goal:** Present the findings to the user.
 
@@ -294,7 +294,7 @@
 
 ---
 
-## Slide 18: Conclusion & Summary
+## 18: Conclusion & Summary
 
 **Recap:**
 
@@ -318,7 +318,7 @@
 
 ---
 
-## Slide 19: Q&A / Next Steps
+## 19: Q&A / Next Steps
 
 **Discussion Points:**
 

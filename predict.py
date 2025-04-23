@@ -59,9 +59,9 @@ XGB_CV_SPLITS = 5 # Number of splits for TimeSeriesSplit in hyperparameter tunin
 # Rolling window sizes for volatility features
 VOLATILITY_WINDOWS = [5, 21, 63] # Added longer window
 # Quantiles for XGBoost prediction interval
-XGB_QUANTILE_LOW = 0.30 # 10th percentile
-XGB_QUANTILE_HIGH = 0.70 # 90th percentile
-XGB_QUANTILE_MEDIAN = 0.50 # Median
+XGB_QUANTILE_LOW = 0.25 # 10th percentile
+XGB_QUANTILE_HIGH = 0.75 # 90th percentile
+XGB_QUANTILE_MEDIAN = 0.60 
 
 # --- Helper Functions ---
 
@@ -388,7 +388,7 @@ def prepare_data_for_model(
     df: pd.DataFrame,
     target_col: str,
     predictor_cols: List[str],
-    test_size: float = 0.001,
+    test_size: float = 0.2,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, bool]:
     """
     Splits data, performs stationarity tests on the target_col, and differencing if needed.
@@ -549,17 +549,20 @@ def train_evaluate_var(
     test_df: pd.DataFrame,
     train_df_diff: pd.DataFrame,
     test_df_diff: pd.DataFrame,
-    target_col: str, # This is the column VAR is trained on (potentially differenced)
+    target_col: str, # This is the column VAR is trained on (potentially differenced log return)
     predictor_cols: List[str],
-    target_was_differenced: bool,
-    target_level_col: str # The original level column name (price or logret)
+    target_was_differenced: bool, # Crucial flag from prepare_data
+    target_level_col: str, # The original level column name (e.g., LOG RETURN name)
+    target_price_col: str, # <<< ADDED: The actual PRICE column name (e.g., 'XYZ_AdjClose')
+    original_target_is_log_return: bool # <<< ADDED: Flag indicating if target_level_col is log return
 ) -> Tuple[Optional[Any], Optional[pd.Series], Optional[Dict[str, float]], Optional[pd.Series]]:
     """
     Trains and evaluates a VAR model. Integrates forecast back to levels
     for plotting and comparable evaluation using target_level_col.
+    Handles conversion from log returns if necessary. <<< MODIFIED DOCSTRING
     """
     logging.info("--- Training and Evaluating VAR ---")
-    var_cols = [target_col] + predictor_cols
+    var_cols = [target_col] + predictor_cols # Target col here is what VAR trains on (e.g., diff_log_return)
     missing_cols = [col for col in var_cols if col not in train_df_diff.columns]
     if missing_cols:
          logging.error(f"Missing columns in differenced training data for VAR: {missing_cols}")
@@ -569,15 +572,25 @@ def train_evaluate_var(
          return None, None, None, None
 
     df_train_var = train_df_diff[var_cols].copy()
-    df_test_var = test_df_diff[var_cols].copy()
+    df_test_var = test_df_diff[var_cols].copy() # Used mainly for index alignment
     df_train_var = df_train_var.astype(float).replace([np.inf, -np.inf], np.nan).dropna()
-    df_test_var = df_test_var.astype(float)
+
+    # --- Check necessary columns exist in original dataframes for integration/conversion ---
+    if target_level_col not in train_df.columns:
+         logging.error(f"Target level column '{target_level_col}' (e.g., log return) not found in train_df for integration base.")
+         return None, None, None, None
+    if target_price_col not in train_df.columns or target_price_col not in test_df.columns:
+         logging.error(f"Target price column '{target_price_col}' not found in train/test dataframes for price conversion.")
+         return None, None, None, None
+
+
+    df_test_var = df_test_var.astype(float) # Ensure test index alignment data is float
     if df_train_var.empty:
          logging.error("Training data for VAR became empty after handling NaNs/Infs.")
          return None, None, None, None
 
     model_fitted = None
-    forecast_series_level = None
+    forecast_series_level = None # This will store the FINAL PRICE forecast
     metrics_level = None
     residuals = None
 
@@ -585,75 +598,170 @@ def train_evaluate_var(
         logging.info("Selecting optimal VAR lag order using AIC...")
         model_select = VAR(df_train_var)
         n_vars = len(var_cols)
+        # Adjust maxlags calculation for robustness
         maxlags_to_test = min(DEFAULT_GRANGER_MAX_LAG_SEARCH, int(len(df_train_var)**(1/3)) )
-        maxlags_to_test = min(maxlags_to_test, (len(df_train_var) - 1) // n_vars -1)
-        if maxlags_to_test < 1: maxlags_to_test = 1
-        logging.info(f"Testing VAR lags up to {maxlags_to_test}")
+        safe_max_lag = max(1, (len(df_train_var) - 1) // n_vars - 1) # Ensure enough data points per parameter
+        maxlags_to_test = min(maxlags_to_test, safe_max_lag)
+        if maxlags_to_test < 1:
+             logging.warning(f"Not enough data ({len(df_train_var)} samples, {n_vars} vars) for VAR lag selection > 0. Defaulting to lag 1.")
+             maxlags_to_test = 1 # Force at least 1 if possible, otherwise fit might fail later
+
         best_lag = 1
         try:
              if maxlags_to_test > 0:
                   selected_orders = model_select.select_order(maxlags=maxlags_to_test)
                   best_lag = selected_orders.aic
+                  # Handle case where select_order might return non-positive lag if data is very short
+                  if best_lag <= 0:
+                      logging.warning(f"AIC selected non-positive lag ({best_lag}). Defaulting to lag 1.")
+                      best_lag = 1
                   logging.info(f"Optimal VAR lag selected by AIC: {best_lag}")
              else:
-                  logging.warning("Not enough data for VAR lag selection. Defaulting to lag 1.")
+                  # Already warned above, confirming lag 1
+                  logging.info("Defaulting to VAR lag 1 due to data constraints.")
+                  best_lag = 1
         except Exception as e:
              logging.warning(f"VAR lag selection failed: {e}. Defaulting to lag 1.")
+             best_lag = 1
+
 
         logging.info(f"Fitting VAR({best_lag})...")
         model = VAR(df_train_var)
         model_fitted = model.fit(best_lag)
         logging.info(model_fitted.summary())
-        logging.info("Generating VAR forecast on test set (differenced scale)...")
+
+        logging.info("Generating VAR forecast on test set (differenced or original logret scale)...")
         lag_order = model_fitted.k_ar
         if len(df_train_var) < lag_order:
              logging.error(f"Training data length ({len(df_train_var)}) < VAR lag order ({lag_order}). Cannot forecast.")
              return model_fitted, None, None, None
+
         forecast_input = df_train_var.values[-lag_order:]
         try:
-            forecast_diff = model_fitted.forecast(y=forecast_input, steps=len(df_test_var))
+            # Forecast produces predictions on the scale VAR was trained on
+            forecast_raw = model_fitted.forecast(y=forecast_input, steps=len(df_test_var))
         except Exception as fc_e:
             logging.error(f"VAR forecast failed: {fc_e}")
             return model_fitted, None, None, None
 
+        # Ensure forecast_raw is 2D
+        if forecast_raw.ndim == 1:
+            forecast_raw = forecast_raw.reshape(-1, n_vars)
+
+        # Get the forecast specific to the target column VAR was trained on
         target_col_index = df_train_var.columns.get_loc(target_col)
-        target_forecast_diff = forecast_diff[:, target_col_index]
-        forecast_series_diff = pd.Series(target_forecast_diff, index=df_test_var.index)
-
-        logging.info("Integrating VAR forecast back to level scale...")
-        # Ensure the level column exists in train_df
-        if target_level_col not in train_df.columns:
-             logging.error(f"Target level column '{target_level_col}' not found in train_df for integration.")
-             return model_fitted, None, None, model_fitted.resid[target_col] if model_fitted else None
-
-        last_actual_level = train_df[target_level_col].iloc[-1]
-        # Check if last level is valid
-        if not np.isfinite(last_actual_level):
-             logging.error(f"Last actual level value for '{target_level_col}' is not finite. Cannot integrate VAR forecast.")
-             return model_fitted, None, None, model_fitted.resid[target_col] if model_fitted else None
-
-        # Ensure forecast differences are finite before cumsum
-        forecast_series_diff = forecast_series_diff.replace([np.inf, -np.inf], 0).fillna(0)
-        integrated_forecast = last_actual_level + forecast_series_diff.cumsum()
-        forecast_series_level = integrated_forecast
-        # Log integrated forecast stats
-        logging.debug(f"Integrated VAR forecast (level) stats: Min={forecast_series_level.min():.4f}, Max={forecast_series_level.max():.4f}, Mean={forecast_series_level.mean():.4f}")
+        target_forecast_raw_scale = forecast_raw[:, target_col_index]
+        # Create a pandas Series with the correct test index
+        forecast_series_raw_scale = pd.Series(target_forecast_raw_scale, index=df_test_var.index)
+        # Clean the forecast before integration/conversion
+        forecast_series_raw_scale = forecast_series_raw_scale.replace([np.inf, -np.inf], 0).fillna(0)
 
 
-        y_test_level = test_df[target_level_col]
-        eval_df_level = pd.concat([y_test_level, forecast_series_level], axis=1).dropna()
-        if not eval_df_level.empty:
-             metrics_level = calculate_metrics(eval_df_level.iloc[:, 0].values, eval_df_level.iloc[:, 1].values, model_name="VAR Level")
-             logging.info(f"VAR Metrics (on Level Scale - Target: {target_level_col}): {metrics_level}")
+        # --- *** START: MODIFIED INTEGRATION / CONVERSION LOGIC *** ---
+        logging.info("Processing VAR forecast to get price scale prediction...")
+
+        last_actual_price = train_df[target_price_col].iloc[-1] # Get the last ACTUAL PRICE
+        if not np.isfinite(last_actual_price):
+            logging.error(f"Last actual price '{target_price_col}' is not finite ({last_actual_price}). Cannot convert to price.")
+            return model_fitted, None, None, model_fitted.resid[target_col] if model_fitted else None
+
+        if original_target_is_log_return:
+            logging.info(f"Original target was log return ('{target_level_col}'). Reconstructing log returns and converting to price.")
+            reconstructed_log_returns = None
+
+            # Case 1: VAR was trained on DIFFERENCED log returns
+            if target_was_differenced:
+                last_actual_log_return = train_df[target_level_col].iloc[-1]
+                if not np.isfinite(last_actual_log_return):
+                     logging.error(f"Last actual log return '{target_level_col}' is not finite ({last_actual_log_return}). Cannot integrate differenced log returns.")
+                     return model_fitted, None, None, model_fitted.resid[target_col] if model_fitted else None
+
+                reconstructed_log_returns = last_actual_log_return + forecast_series_raw_scale.cumsum()
+                logging.debug(f"Reconstructed log return forecast (from diff): Min={reconstructed_log_returns.min():.4f}, Max={reconstructed_log_returns.max():.4f}")
+
+            # Case 2: VAR was trained DIRECTLY on log returns (they were stationary)
+            else:
+                # The raw forecast IS the log return forecast
+                reconstructed_log_returns = forecast_series_raw_scale
+                logging.debug(f"Using direct log return forecast: Min={reconstructed_log_returns.min():.4f}, Max={reconstructed_log_returns.max():.4f}")
+
+            # Convert the final log return forecast to price
+            forecast_series_level = convert_logret_forecast_to_price(
+                reconstructed_log_returns,
+                last_actual_price # Use the last ACTUAL PRICE as the base
+            )
+            if forecast_series_level is None:
+                 logging.error("Failed to convert reconstructed log return forecast to price.")
+                 # Set metrics to NaN later
+
+        # --- Add case for log price if needed ---
+        # elif original_target_is_log_price: # Need a flag for this
+        #    # ... integrate diff log price, then convert using convert_logprice_forecast_to_price ...
+
+        # --- Case: Original target was price ---
+        else: # Assume original target was price
+            logging.info(f"Original target was price ('{target_level_col}'). Integrating forecast.")
+            if target_was_differenced:
+                 # The old logic: integrate diff(price) using last price
+                 last_actual_level_price = train_df[target_level_col].iloc[-1] # Here target_level_col IS the price col
+                 if not np.isfinite(last_actual_level_price):
+                      logging.error(f"Last actual price '{target_level_col}' is not finite. Cannot integrate differenced price.")
+                      return model_fitted, None, None, model_fitted.resid[target_col] if model_fitted else None
+                 forecast_series_level = last_actual_level_price + forecast_series_raw_scale.cumsum()
+            else: # VAR trained directly on price (no differencing)
+                 # The forecast IS the price forecast
+                 forecast_series_level = forecast_series_raw_scale
+                 logging.warning("VAR trained directly on price level - forecast is already price.")
+
+
+        # --- *** END: MODIFIED INTEGRATION / CONVERSION LOGIC *** ---
+
+
+        # --- Evaluation (always evaluate against ACTUAL PRICE) ---
+        if forecast_series_level is not None:
+             logging.debug(f"Final Price Forecast (VAR) stats: Min={forecast_series_level.min():.4f}, Max={forecast_series_level.max():.4f}, Mean={forecast_series_level.mean():.4f}")
+             y_test_level = test_df[target_price_col] # Evaluate against ACTUAL prices
+             # Align forecast and actual using index (important!)
+             eval_df_level = pd.concat([y_test_level, forecast_series_level], axis=1).dropna()
+             eval_df_level.columns = ['Actual_Price', 'Forecast_Price'] # Rename for clarity
+
+             if not eval_df_level.empty:
+                 # Check shapes before calculating metrics
+                 if eval_df_level['Actual_Price'].shape != eval_df_level['Forecast_Price'].shape:
+                     logging.warning(f"Shape mismatch during VAR price evaluation after alignment: Actual {eval_df_level['Actual_Price'].shape}, Forecast {eval_df_level['Forecast_Price'].shape}")
+                     # Attempt to align if shapes mismatch after concat/dropna (shouldn't happen often)
+                     common_idx = eval_df_level.index
+                     min_len = min(len(eval_df_level['Actual_Price']), len(eval_df_level['Forecast_Price']))
+                     if len(common_idx) != min_len: # If index alignment failed somehow
+                         logging.error("Index alignment failed critically for VAR price evaluation.")
+                         metrics_level = {k: np.nan for k in ['RMSE', 'MAE', 'MAPE', 'Directional_Accuracy', 'Variance_Ratio']}
+                     else: # Use aligned data
+                         metrics_level = calculate_metrics(eval_df_level['Actual_Price'].values, eval_df_level['Forecast_Price'].values, model_name="VAR Price")
+
+                 else: # Shapes match
+                    metrics_level = calculate_metrics(eval_df_level['Actual_Price'].values, eval_df_level['Forecast_Price'].values, model_name="VAR Price")
+
+                 logging.info(f"VAR Metrics (on Price Scale - Target: {target_price_col}): {metrics_level}")
+             else:
+                 logging.warning("Could not evaluate VAR on price scale due to alignment issues after integration/conversion (eval_df_level is empty).")
+                 metrics_level = {k: np.nan for k in ['RMSE', 'MAE', 'MAPE', 'Directional_Accuracy', 'Variance_Ratio']}
         else:
-             logging.warning("Could not evaluate VAR on level scale due to alignment issues after integration.")
-             metrics_level = {k: np.nan for k in ['RMSE', 'MAE', 'MAPE', 'Directional_Accuracy', 'Variance_Ratio']}
-        residuals = model_fitted.resid[target_col]
+            logging.error("VAR final price forecast could not be generated.")
+            metrics_level = {k: np.nan for k in ['RMSE', 'MAE', 'MAPE', 'Directional_Accuracy', 'Variance_Ratio']}
+
+        # Extract residuals for the target variable VAR was trained on
+        if model_fitted and target_col in model_fitted.resid.columns:
+            residuals = model_fitted.resid[target_col]
+        else:
+            residuals = None
+
 
     except Exception as e:
         logging.error(f"Error during VAR training/evaluation: {e}", exc_info=True)
-        return model_fitted, None, None, None
+        # Ensure return values are consistent in case of error
+        return model_fitted, None, {k: np.nan for k in ['RMSE', 'MAE', 'MAPE', 'Directional_Accuracy', 'Variance_Ratio']}, None
 
+    # Return the fitted model, the PRICE forecast, the PRICE metrics, and residuals (on the trained scale)
     return model_fitted, forecast_series_level, metrics_level, residuals
 
 # Modified: Includes feature engineering and hyperparameter tuning
@@ -858,7 +966,7 @@ def train_evaluate_xgboost_quantile(
 def plot_forecast_comparison(
     actual_train: pd.Series,
     actual_test: pd.Series,
-    forecasts_dict: Dict[str, Optional[pd.Series]],  # Includes 'XGBoost_Avg', 'XGBoost Q0.25', 'XGBoost Q0.75'
+    forecasts_dict: Dict[str, Optional[pd.Series]], # Contains SARIMAX, VAR, XGB_Median, XGB_Low, XGB_High
     target_col: str,
     output_dir: str,
     plot_title_suffix: str = ""
@@ -870,50 +978,51 @@ def plot_forecast_comparison(
     plt.plot(actual_train.index, actual_train, label='Train Actual', color='black', alpha=0.7)
     plt.plot(actual_test.index, actual_test, label='Test Actual', color='blue', linewidth=2)
 
-    # Define keys explicitly
+    # Separate XGB quantile forecasts
     xgb_low_key = f'XGBoost Q{XGB_QUANTILE_LOW:.2f}'
     xgb_high_key = f'XGBoost Q{XGB_QUANTILE_HIGH:.2f}'
-    xgb_avg_key = 'XGBoost_Avg'
+    xgb_median_key = f'XGBoost Q{XGB_QUANTILE_MEDIAN:.2f}'
 
-    xgb_low = forecasts_dict.get(xgb_low_key, None)
-    xgb_high = forecasts_dict.get(xgb_high_key, None)
-    xgb_avg = forecasts_dict.get(xgb_avg_key, None)
+    xgb_low = forecasts_dict.pop(xgb_low_key, None)
+    xgb_high = forecasts_dict.pop(xgb_high_key, None)
+    xgb_median = forecasts_dict.pop(xgb_median_key, None) # Median is plotted as line
 
-    colors = plt.cm.viridis(np.linspace(0, 1, len(forecasts_dict)))
-
+    # Plot other models (SARIMAX, VAR)
+    colors = plt.cm.viridis(np.linspace(0, 1, len(forecasts_dict) + 1)) # +1 for XGB median
     plot_idx = 0
-    # Plot forecasts (excluding XGBoost quantiles to plot separately)
     for model_name, forecast in forecasts_dict.items():
-        if model_name in [xgb_low_key, xgb_high_key, xgb_avg_key]:
-            continue  # Skip XGBoost keys for separate plotting
         if forecast is not None:
             common_index = actual_test.index.intersection(forecast.index)
             if not common_index.empty:
-                plt.plot(common_index, forecast.loc[common_index], label=f'{model_name} Forecast',
-                         linestyle='--', color=colors[plot_idx])
-                plot_idx += 1
+                 plt.plot(common_index, forecast.loc[common_index], label=f'{model_name} Forecast', linestyle='--', color=colors[plot_idx])
+                 plot_idx += 1
             else:
-                logging.warning(f"Index mismatch for {model_name}; skipping plot.")
-
-    # Plot XGBoost average forecast
-    if xgb_avg is not None:
-        common_index_avg = actual_test.index.intersection(xgb_avg.index)
-        plt.plot(common_index_avg, xgb_avg.loc[common_index_avg], label='XGBoost Average Forecast',
-                 linestyle='-', color='orange', linewidth=2)
-
-    # Plot quantile range band
-    if xgb_low is not None and xgb_high is not None:
-        common_index_band = actual_test.index.intersection(xgb_low.index).intersection(xgb_high.index)
-        if not common_index_band.empty:
-            low_bound = np.minimum(xgb_low.loc[common_index_band], xgb_high.loc[common_index_band])
-            high_bound = np.maximum(xgb_low.loc[common_index_band], xgb_high.loc[common_index_band])
-            plt.fill_between(common_index_band, low_bound, high_bound,
-                             color='orange', alpha=0.3,
-                             label=f'XGBoost {int(XGB_QUANTILE_LOW*100)}-{int(XGB_QUANTILE_HIGH*100)}th Percentile')
+                 logging.warning(f"Could not plot forecast for {model_name} due to index mismatch or empty forecast.")
         else:
-            logging.warning("Index mismatch for XGBoost quantile bands; skipping plot.")
-    else:
-        logging.warning("Missing XGBoost quantile forecasts; skipping quantile band.")
+             logging.warning(f"Forecast for {model_name} is None, skipping plot.")
+
+    # Plot XGBoost Median and Quantile Band
+    if xgb_median is not None:
+        common_index_xgb = actual_test.index.intersection(xgb_median.index)
+        if not common_index_xgb.empty:
+            plt.plot(common_index_xgb, xgb_median.loc[common_index_xgb], label=f'XGBoost Median Forecast', linestyle='--', color=colors[plot_idx])
+            # Plot shaded region if low and high quantiles are available
+            if xgb_low is not None and xgb_high is not None:
+                 common_index_low = actual_test.index.intersection(xgb_low.index)
+                 common_index_high = actual_test.index.intersection(xgb_high.index)
+                 common_index_band = common_index_low.intersection(common_index_high)
+                 if not common_index_band.empty:
+                      # Ensure low <= high for fill_between
+                      low_bound = np.minimum(xgb_low.loc[common_index_band], xgb_high.loc[common_index_band])
+                      high_bound = np.maximum(xgb_low.loc[common_index_band], xgb_high.loc[common_index_band])
+                      plt.fill_between(common_index_band, low_bound, high_bound,
+                                       color=colors[plot_idx], alpha=0.2,
+                                       label=f'XGBoost {int(XGB_QUANTILE_LOW*100)}-{int(XGB_QUANTILE_HIGH*100)}th Percentile')
+                 else:
+                      logging.warning("Could not plot XGBoost quantile band due to index mismatch.")
+        else:
+             logging.warning("XGBoost median forecast is None, skipping plot.")
+
 
     title = f'Actual vs. Forecasted {target_col}'
     if plot_title_suffix:
@@ -936,7 +1045,7 @@ def plot_forecast_comparison(
 def plot_price_forecast_comparison(
     actual_train_price: pd.Series,
     actual_test_price: pd.Series,
-    price_forecasts_dict: Dict[str, Optional[pd.Series]],  # Contains SARIMAX, VAR, XGBoost_Avg, XGB_Low, XGB_High prices
+    price_forecasts_dict: Dict[str, Optional[pd.Series]], # Contains SARIMAX, VAR, XGB_Median, XGB_Low, XGB_High prices
     target_price_col: str,
     output_dir: str
 ):
@@ -947,48 +1056,46 @@ def plot_price_forecast_comparison(
     plt.plot(actual_train_price.index, actual_train_price, label='Train Actual Price', color='black', alpha=0.7)
     plt.plot(actual_test_price.index, actual_test_price, label='Test Actual Price', color='blue', linewidth=2)
 
-    # Define XGB forecast keys explicitly
-    xgb_low_key = f'XGBoost Q{XGB_QUANTILE_LOW:.2f}'
-    xgb_high_key = f'XGBoost Q{XGB_QUANTILE_HIGH:.2f}'
-    xgb_avg_key = 'XGBoost_Avg'
-
-    xgb_low_price = price_forecasts_dict.get(xgb_low_key, None)
-    xgb_high_price = price_forecasts_dict.get(xgb_high_key, None)
-    xgb_avg_price = price_forecasts_dict.get(xgb_avg_key, None)
-
-    colors = plt.cm.viridis(np.linspace(0, 1, len(price_forecasts_dict)))
-    plot_idx = 0
+    # Separate XGB quantile price forecasts
+    xgb_low_price = price_forecasts_dict.pop(f'XGBoost Q{XGB_QUANTILE_LOW:.2f}', None)
+    xgb_high_price = price_forecasts_dict.pop(f'XGBoost Q{XGB_QUANTILE_HIGH:.2f}', None)
+    xgb_median_price = price_forecasts_dict.pop(f'XGBoost Q{XGB_QUANTILE_MEDIAN:.2f}', None)
 
     # Plot other models (SARIMAX, VAR)
+    colors = plt.cm.viridis(np.linspace(0, 1, len(price_forecasts_dict) + 1)) # +1 for XGB median
+    plot_idx = 0
     for model_name, forecast in price_forecasts_dict.items():
-        if model_name in [xgb_low_key, xgb_high_key, xgb_avg_key]:
-            continue  # Skip XGBoost forecasts for separate plotting
         if forecast is not None:
             common_index = actual_test_price.index.intersection(forecast.index)
             if not common_index.empty:
-                plt.plot(common_index, forecast.loc[common_index], label=f'{model_name} Price Forecast', linestyle='--', color=colors[plot_idx])
-                plot_idx += 1
+                 plt.plot(common_index, forecast.loc[common_index], label=f'{model_name} Price Forecast', linestyle='--', color=colors[plot_idx])
+                 plot_idx += 1
             else:
-                logging.warning(f"Could not plot PRICE forecast for {model_name} due to index mismatch or empty forecast.")
+                 logging.warning(f"Could not plot PRICE forecast for {model_name} due to index mismatch or empty forecast.")
         else:
-            logging.warning(f"PRICE forecast for {model_name} is None, skipping plot.")
+             logging.warning(f"PRICE forecast for {model_name} is None, skipping plot.")
 
-    # Plot XGBoost average forecast
-    if xgb_avg_price is not None:
-        common_index_avg = actual_test_price.index.intersection(xgb_avg_price.index)
-        plt.plot(common_index_avg, xgb_avg_price.loc[common_index_avg], label='XGBoost Avg Price Forecast', linestyle='-', color='orange', linewidth=2)
-
-    # Plot XGBoost quantile range band
-    if xgb_low_price is not None and xgb_high_price is not None:
-        common_index_band = actual_test_price.index.intersection(xgb_low_price.index).intersection(xgb_high_price.index)
-        if not common_index_band.empty:
-            low_bound = np.minimum(xgb_low_price.loc[common_index_band], xgb_high_price.loc[common_index_band])
-            high_bound = np.maximum(xgb_low_price.loc[common_index_band], xgb_high_price.loc[common_index_band])
-            plt.fill_between(common_index_band, low_bound, high_bound,
-                             color='orange', alpha=0.3,
-                             label=f'XGBoost {int(XGB_QUANTILE_LOW*100)}-{int(XGB_QUANTILE_HIGH*100)}th Percentile Price')
+    # Plot XGBoost Median and Quantile Band (Prices)
+    if xgb_median_price is not None:
+        common_index_xgb = actual_test_price.index.intersection(xgb_median_price.index)
+        if not common_index_xgb.empty:
+            plt.plot(common_index_xgb, xgb_median_price.loc[common_index_xgb], label=f'XGBoost Median Price Forecast', linestyle='--', color=colors[plot_idx])
+            if xgb_low_price is not None and xgb_high_price is not None:
+                 common_index_low = actual_test_price.index.intersection(xgb_low_price.index)
+                 common_index_high = actual_test_price.index.intersection(xgb_high_price.index)
+                 common_index_band = common_index_low.intersection(common_index_high)
+                 if not common_index_band.empty:
+                      # Ensure low <= high for fill_between
+                      low_bound = np.minimum(xgb_low_price.loc[common_index_band], xgb_high_price.loc[common_index_band])
+                      high_bound = np.maximum(xgb_low_price.loc[common_index_band], xgb_high_price.loc[common_index_band])
+                      plt.fill_between(common_index_band, low_bound, high_bound,
+                                       color=colors[plot_idx], alpha=0.25,
+                                       label=f'XGBoost {int(XGB_QUANTILE_LOW*100)}-{int(XGB_QUANTILE_HIGH*100)}th Percentile Price')
+                 else:
+                      logging.warning("Could not plot XGBoost PRICE quantile band due to index mismatch.")
         else:
-            logging.warning("Could not plot XGBoost PRICE quantile band due to index mismatch.")
+             logging.warning("XGBoost median PRICE forecast is None, skipping plot.")
+
 
     plt.title(f'Actual vs. Forecasted Price ({target_price_col})', fontsize=16)
     plt.xlabel('Date', fontsize=12)
@@ -1149,6 +1256,7 @@ def main():
     level_forecasts = {}
     residuals = {}
     xgb_feat_importance = None
+    price_forecasts = {}
 
     # 4. SARIMAX
     top_1_predictor = actual_predictor_cols[0] if actual_predictor_cols else None
@@ -1162,32 +1270,47 @@ def main():
 
     # 5. VAR
     if not train_df_diff.empty and not test_df_diff.empty:
-        var_model, var_fc_level, var_metrics_level, var_resid_diff = train_evaluate_var(
-            train_df, test_df, train_df_diff, test_df_diff,
-            modeling_target_col, # Target VAR was trained on (potentially differenced)
-            actual_predictor_cols,
-            target_differenced,
-            modeling_target_col # Target level col for integration/evaluation
-        )
-        if var_metrics_level:
-            model_results["VAR"] = var_metrics_level # Store level metrics
-            level_forecasts["VAR"] = var_fc_level # Store level forecast
-            residuals["VAR"] = var_resid_diff # Store diff residuals
+            var_target_col_in_diff_df = modeling_target_col # If VAR is trained on differenced data, the column name is the same
+
+            var_model, var_fc_price, var_metrics_price, var_resid_diff = train_evaluate_var( # Renamed var_fc_logret -> var_fc_price, var_metrics_logret -> var_metrics_price for clarity as it now returns price-scale results
+                train_df=train_df,
+                test_df=test_df,
+                train_df_diff=train_df_diff,
+                test_df_diff=test_df_diff,
+                target_col=var_target_col_in_diff_df, # The column VAR trains on (potentially differenced logret/price)
+                predictor_cols=actual_predictor_cols,
+                target_was_differenced=target_differenced,
+                target_level_col=modeling_target_col, # The original target name (e.g., logret or price)
+                # --- ADD THESE TWO ARGUMENTS ---
+                target_price_col=target_price_col, # The actual price column name ('XYZ_AdjClose')
+                original_target_is_log_return=args.use_log_returns # Flag if the modeling_target_col was log returns
+                # --- END ADDED ARGUMENTS ---
+            )
+            # Update result storage to reflect price-scale results from VAR
+            if var_metrics_price:
+                # VAR metrics are now calculated on the PRICE scale inside train_evaluate_var
+                model_results["VAR_Price"] = var_metrics_price
+                # The forecast returned is now the PRICE forecast
+                price_forecasts["VAR"] = var_fc_price # Store the price forecast directly
+                # Residuals are still from the scale VAR was trained on (potentially differenced)
+                if var_resid_diff is not None:
+                     residuals["VAR"] = var_resid_diff
+            else:
+                 logging.warning("VAR model did not produce valid metrics or forecasts.")
+
     else:
-         logging.warning("Skipping VAR model as differenced data is empty.")
+            logging.warning("Skipping VAR model as differenced data is empty.")
 
     # 6. XGBoost (Quantile Regression)
     xgb_train_df = train_df_diff if target_differenced else train_df
     xgb_test_df = test_df_diff if target_differenced else test_df
-    xgb_forecasts_quantiles = {}
+    xgb_forecasts_quantiles = {} # Store low, median, high forecasts on modeling scale
 
     if not xgb_train_df.empty and not xgb_test_df.empty:
-        quantiles_to_run = [XGB_QUANTILE_LOW, XGB_QUANTILE_HIGH]
-        quantile_forecasts = []
-
-        for q in quantiles_to_run:
+        # Train for Median, Low, High quantiles
+        for q, q_name_suffix in [(XGB_QUANTILE_MEDIAN, "Median"), (XGB_QUANTILE_LOW, "Low"), (XGB_QUANTILE_HIGH, "High")]:
             q_key = f'XGBoost Q{q:.2f}'
-            _, xgb_fc_q, _, _, _ = train_evaluate_xgboost_quantile(
+            xgb_model, xgb_fc_q, xgb_metrics_q, xgb_feat_importance_q, xgb_resid_q = train_evaluate_xgboost_quantile(
                 xgb_train_df, xgb_test_df, modeling_target_col, actual_predictor_cols,
                 lags=args.xgb_lags,
                 scale_features=args.xgb_scale,
@@ -1195,31 +1318,34 @@ def main():
                 add_garch_feature=args.add_garch,
                 quantile=q
             )
+            # Store results - only store metrics and importance for the median run
+            if q == XGB_QUANTILE_MEDIAN:
+                if xgb_metrics_q: model_results["XGBoost"] = xgb_metrics_q # Store median metrics
+                if xgb_feat_importance_q is not None: xgb_feat_importance = xgb_feat_importance_q
+                if xgb_resid_q is not None: residuals["XGBoost Median"] = xgb_resid_q # Label residual dict key
+
+            # Store the forecast for this quantile (on modeling scale)
             xgb_forecasts_quantiles[q_key] = xgb_fc_q
-            quantile_forecasts.append(xgb_fc_q)
 
-        # Compute average forecast from narrowed quantiles
-        if all(fc is not None for fc in quantile_forecasts):
-            avg_xgb_forecast = sum(quantile_forecasts) / len(quantile_forecasts)
-            level_forecasts["XGBoost_Avg"] = avg_xgb_forecast
-
-            # Calculate metrics for averaged forecast
-            y_true = xgb_test_df[modeling_target_col]
-            avg_metrics = calculate_metrics(y_true.values, avg_xgb_forecast.values, model_name="XGBoost_Avg")
-            model_results["XGBoost_Avg"] = avg_metrics
-            logging.info(f"XGBoost Average Metrics (Target: {modeling_target_col}): {avg_metrics}")
-        else:
-            logging.error("One or more XGBoost quantile forecasts failed; skipping average calculation.")
-
-        # Integration back to level scale (if necessary)
+        # Integrate forecasts back to level scale if needed
         if target_differenced:
-            logging.info("Integrating XGBoost averaged forecast back to level scale...")
+            logging.info("Integrating XGBoost quantile forecasts back to level scale...")
             last_actual_level_xgb = train_df[modeling_target_col].iloc[-1]
-            if np.isfinite(last_actual_level_xgb):
-                level_forecasts["XGBoost_Avg"] = last_actual_level_xgb + level_forecasts["XGBoost_Avg"].cumsum()
-    else:
-        logging.warning("Skipping XGBoost model as input dataframes are empty.")
+            if not np.isfinite(last_actual_level_xgb):
+                 logging.error(f"Last actual level for XGBoost integration is not finite ({modeling_target_col}). Cannot integrate.")
+            else:
+                for q_key, fc_q in xgb_forecasts_quantiles.items():
+                     if fc_q is not None:
+                          level_forecasts[q_key] = last_actual_level_xgb + fc_q.cumsum()
+                     else:
+                          level_forecasts[q_key] = None
+        else:
+            # Forecasts are already on level scale
+            for q_key, fc_q in xgb_forecasts_quantiles.items():
+                 level_forecasts[q_key] = fc_q
 
+    else:
+         logging.warning("Skipping XGBoost model as input dataframes are empty.")
 
     # --- Reporting ---
     logging.info("\n--- Model Comparison ---")
@@ -1243,42 +1369,44 @@ def main():
         plot_title_suffix="Log Returns" if args.use_log_returns else "Price Levels"
     )
 
-    # 2. Convert forecasts to Price scale and plot
-    logging.info("Converting level forecasts to Price scale for plotting...")
-    price_forecasts = {}
+    # 2. Convert ALL forecasts from LOG RETURN scale to PRICE scale --- *** STANDARDIZED LOGIC (Same as previous version) *** ---
+    logging.info("Converting all log return forecasts to Price scale for plotting...")
     last_actual_price = train_df[target_price_col].iloc[-1]
+
     if not np.isfinite(last_actual_price):
-         logging.error(f"Last actual price ({target_price_col}) is not finite. Cannot convert forecasts to price scale.")
+         logging.error(f"Last actual price ({target_price_col}) is not finite ({last_actual_price}). Cannot convert forecasts to price scale.")
     else:
-        for model_name, fc_level in level_forecasts.items(): # fc_level is on modeling_target_col scale
-            if fc_level is None: continue
-            if args.use_log_returns and target_logret_col is not None:
-                # If modeling target was log returns
-                # --- Corrected Price Conversion Logic ---
-                if model_name.startswith("XGBoost") or model_name == "SARIMAX":
-                     # These models predicted log returns (fc_level is log returns)
-                     price_forecasts[model_name] = convert_logret_forecast_to_price(fc_level, last_actual_price)
-                elif model_name == "VAR":
-                     # VAR fc_level is integrated log returns (log price)
-                     price_forecasts[model_name] = convert_logprice_forecast_to_price(fc_level)
-                # -----------------------------------------
+        # Loop through the forecasts which are ALL on the log return scale
+        for model_name, fc_logret in level_forecasts.items():
+            if fc_logret is None:
+                logging.warning(f"Skipping price conversion for {model_name} as log return forecast is None.")
+                continue
+
+            logging.debug(f"Converting {model_name} forecast from log return to price...")
+            # Use the helper function with the log return forecast and last actual price
+            converted_price = convert_logret_forecast_to_price(fc_logret, last_actual_price)
+
+            if converted_price is not None:
+                price_forecasts[model_name] = converted_price
+                logging.debug(f" -> Price forecast stats ({model_name}): Min={converted_price.min():.4f}, Max={converted_price.max():.4f}")
             else:
-                # If modeling target was price (fc_level is already price)
-                price_forecasts[model_name] = fc_level
+                logging.warning(f"Could not convert {model_name} forecast (log returns) to price.")
+    # --- *** END STANDARDIZED LOGIC *** ---
 
-    # Plot price comparison - includes XGB quantiles converted to price
-    plot_price_forecast_comparison(
-        train_df[target_price_col],
-        test_df[target_price_col],
-        price_forecasts, # This now contains price forecasts for all models/quantiles
-        target_price_col,
-        args.output_dir
-    )
+    # Plot price comparison
+    if price_forecasts:
+         plot_price_forecast_comparison(
+             train_df[target_price_col], test_df[target_price_col],
+             price_forecasts, target_price_col, args.output_dir
+         )
+    else:
+         logging.warning("Skipping price forecast plot as no forecasts could be converted to price.")
 
-    # 3. Plot Residuals (Residuals are on the scale the model was trained/evaluated on)
+    # 3. Plot Residuals (Adjust labels for clarity)
     if "SARIMAX" in residuals: plot_residuals_diagnostics("SARIMAX", residuals["SARIMAX"], args.output_dir, modeling_target_col)
-    if "VAR" in residuals: plot_residuals_diagnostics("VAR", residuals["VAR"], args.output_dir, modeling_target_col + " (Diff)")
-    if "XGBoost Median" in residuals: plot_residuals_diagnostics("XGBoost Median", residuals["XGBoost Median"], args.output_dir, modeling_target_col) # Use median residuals
+    if "VAR" in residuals: plot_residuals_diagnostics("VAR", residuals["VAR"], args.output_dir, var_target_col_in_diff_df + " (Diff Scale)" if target_differenced else modeling_target_col)
+    if "XGBoost Median" in residuals: plot_residuals_diagnostics("XGBoost Median", residuals["XGBoost Median"], args.output_dir, modeling_target_col + (" (Diff Scale)" if target_differenced else ""))
+
 
     # 4. Plot Feature Importance (from median XGBoost model)
     if xgb_feat_importance is not None: plot_feature_importance(xgb_feat_importance, args.output_dir, modeling_target_col)
